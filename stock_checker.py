@@ -264,24 +264,102 @@ def fetch_uniqlo(url: str, product_no: str, browser, *, config: dict) -> Product
 
 
 def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
-    """Adidas US — JSON-LD Product + DOM 'unavailable' class."""
+    """Adidas US — JSON-LD Product + DOM 'unavailable' class.
+
+    한국 IP / Accept-Language 등에서 접속 시 adidas.co.kr 로 server-redirect 되어
+    JSON-LD 의 `color` 가 비거나 사이즈 라벨이 'J/XS' 같은 일본 표기로 바뀌는
+    문제가 있다. 다음 4단계로 강제 US 사이트 유지:
+      1) en-US locale + America/New_York timezone + 뉴욕 geolocation 설정한 context
+      2) Accept-Language / Referer / sec-ch-ua-* 등 US 브라우저 헤더 주입
+      3) adidas.com US 도메인에 미리 region/locale 쿠키 심기
+         (geoCountry=US, locale=en_US, akacd_*=US, geoip=US-…)
+      4) `page.route('**/adidas.co.kr/**')` 로 .co.kr 호스트 네트워크 요청 abort
+         + 최종 URL 이 여전히 adidas.com 인지 검증
+    색상은 JSON-LD `color` (full name, e.g. 'Pure Tangerine / Pure Orange') →
+    title 패턴 ('adidas <name> - <Color> | ...') → __NEXT_DATA__ 의
+    `attribute_list.color` 순으로 fallback 한다.
+    """
     r = ProductResult(product_no=product_no, url=url)
-    ctx = browser.new_context(user_agent=DEFAULT_UA, locale="en-US")
+    ctx = browser.new_context(
+        user_agent=DEFAULT_UA,
+        locale="en-US",
+        timezone_id="America/New_York",
+        geolocation={"latitude": 40.7128, "longitude": -74.0060},
+        permissions=["geolocation"],
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.adidas.com/us",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+    )
+    # 1) 모든 adidas 도메인에 region/locale 강제 쿠키.
+    ctx.add_cookies([
+        {"name": "geoCountry",   "value": "US",     "domain": ".adidas.com", "path": "/"},
+        {"name": "geoRedirect",  "value": "false",  "domain": ".adidas.com", "path": "/"},
+        {"name": "country",      "value": "US",     "domain": ".adidas.com", "path": "/"},
+        {"name": "locale",       "value": "en_US",  "domain": ".adidas.com", "path": "/"},
+        {"name": "language",     "value": "en",     "domain": ".adidas.com", "path": "/"},
+        {"name": "default_country", "value": "US",  "domain": ".adidas.com", "path": "/"},
+    ])
+    page = ctx.new_page()
+    # 2) .co.kr / .jp 호스트로 가는 네트워크 요청은 전부 차단해 redirect 자체를 무력화.
+    def _block_locale_redirect(route, request):
+        host = urlparse(request.url).netloc.lower()
+        if "adidas.co.kr" in host or "adidas.jp" in host:
+            try:
+                route.abort()
+            except Exception:
+                pass
+        else:
+            route.continue_()
+    page.route("**/*", _block_locale_redirect)
+
     try:
-        page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(config.get("wait_ms", 5500))
+
+        final_host = urlparse(page.url).netloc.lower()
+        if "adidas.com" not in final_host or "co.kr" in final_host:
+            r.error = f"adidas_us redirected to {final_host} despite block; check region cookies/IP"
+            return r
+
         data = page.evaluate(
             """() => {
                 const ld = document.querySelector('script[type="application/ld+json"]');
                 const btns = Array.from(document.querySelectorAll('[class*="size-selector_size__"]'))
                     .map(b => ({text: (b.textContent||'').trim(), cls: String(b.className)}));
-                return {ld: ld?.textContent || null, sizes: btns};
+                // __NEXT_DATA__ 의 attribute_list.color (full color name) 와 search_col (short)
+                let ndColor = null, ndSearchCol = null;
+                try {
+                    const nd = document.getElementById('__NEXT_DATA__');
+                    if (nd) {
+                        const data = JSON.parse(nd.textContent);
+                        const q = data?.props?.pageProps?.dehydratedState?.queries?.[0];
+                        const attrs = q?.state?.data?.attribute_list || {};
+                        ndColor = attrs.color || null;
+                        ndSearchCol = attrs.search_col || null;
+                    }
+                } catch (e) {}
+                return {
+                    ld: ld?.textContent || null,
+                    sizes: btns,
+                    title: document.title || '',
+                    ndColor, ndSearchCol,
+                };
             }"""
         )
         ld = json.loads(data["ld"]) if data["ld"] else {}
-        color = ld.get("color") or "Default"
-        offers = ld.get("offers") or {}
+
+        # 색상 추출: JSON-LD → __NEXT_DATA__ → title 정규식 → 'Default'
+        color = (
+            (ld.get("color") if isinstance(ld, dict) else None)
+            or data.get("ndColor")
+            or _adidas_color_from_title(data.get("title") or "")
+            or data.get("ndSearchCol")
+            or "Default"
+        )
+
+        offers = ld.get("offers") or {} if isinstance(ld, dict) else {}
         price = offers.get("price")
         currency = offers.get("priceCurrency") or "USD"
         sizes: list[SizeVariant] = []
@@ -297,6 +375,18 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
     finally:
         ctx.close()
     return r
+
+
+def _adidas_color_from_title(title: str) -> Optional[str]:
+    """'adidas <product name> - <Color> | Free Shipping with adiClub' → '<Color>'.
+
+    JSON-LD 가 없거나 region redirect 직후 색상을 비웠을 때 fallback.
+    'adidas' / 'adidas Performance' 등 brand prefix 처리.
+    """
+    if not title:
+        return None
+    m = re.match(r"^\s*adidas(?:\s+\w+)?\s+.+?\s+-\s+(.+?)\s+\|\s*", title, re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
 
 def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
@@ -921,7 +1011,7 @@ def main():
                               ", ".join(ev['sizes']), link])
         for ev in price_events:
             alert_rows.append([kst_now(), f"#{ev['no']} {ev['name']}", ev['color'], "PRICE",
-                              f"{ev['from']} → {ev['to']} ({ev['pct']:+.1f}%)", link])
+                              f"{ev['from']} -> {ev['to']} ({ev['pct']:+.1f}%)", link])
         if alert_rows:
             sheets.append("변동 알림", alert_rows)
 
