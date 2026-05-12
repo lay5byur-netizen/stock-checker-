@@ -116,6 +116,35 @@ def uniqlo_color_label(color_name: str | None, display_code: str) -> str:
     return f"색상{code}" if code else "색상미상"
 
 
+# Uniqlo 사이즈 코드 매핑 — API 의 sizeName 이 null/빈값일 때 SMA code → 사람-읽기 좋은 사이즈 라벨.
+# Uniqlo 일본 사이트의 일반적인 성인 의류 사이즈 코드. 일부 상품은 sizeName 도 비어있을 수 있어 fallback 필수.
+UNIQLO_SIZE_MAP = {
+    "SMA001": "XXS", "SMA002": "XS",  "SMA003": "S",   "SMA004": "M",
+    "SMA005": "L",   "SMA006": "XL",  "SMA007": "XXL", "SMA008": "3XL",
+    "SMA009": "4XL", "SMA010": "5XL",
+    # 일부 카테고리 (니트/스웨터 등) 는 다른 SMA 블록 사용
+    # 다음은 V-neck 카디건 등 상품에서 관찰된 패턴:
+    "SMA021": "XS",  "SMA022": "S",   "SMA023": "M",   "SMA024": "L",
+    "SMA025": "XL",  "SMA026": "XXL", "SMA027": "3XL",
+    # 여성 사이즈 블록 예시 (SMA0xx 의 다른 prefix 가 나오면 추가)
+    "SMA101": "XS",  "SMA102": "S",   "SMA103": "M",   "SMA104": "L",
+    "SMA105": "XL",
+}
+
+
+def uniqlo_size_label(api_name: str | None, size_code: str, display_code: str = "") -> str:
+    """sizeName 우선 → SMA 매핑 → displayCode → raw code 순으로 fallback."""
+    if api_name and api_name.strip():
+        return api_name.strip()
+    sc = (size_code or "").strip()
+    if sc in UNIQLO_SIZE_MAP:
+        return UNIQLO_SIZE_MAP[sc]
+    dc = (display_code or "").strip()
+    if dc:
+        return f"사이즈{dc}"
+    return sc or "사이즈?"
+
+
 def fetch_nike(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
     """Nike US/JP — __NEXT_DATA__ + JSON-LD ProductGroup."""
     r = ProductResult(product_no=product_no, url=url)
@@ -213,7 +242,12 @@ def fetch_uniqlo(url: str, product_no: str, browser, *, config: dict) -> Product
             l.get("pld", {}).get("code", ""),
         )
         size_code = l.get("size", {}).get("code")
-        size_name = next((s.get("name") for s in sizes_meta if s.get("code") == size_code), size_code)
+        size_display_code = l.get("size", {}).get("displayCode", "")
+        # sizes_meta 에서 매칭되는 항목의 name 을 찾되, name 이 null/빈값일 가능성을 안전하게 처리
+        matching_size = next((s for s in sizes_meta if s.get("code") == size_code), {})
+        size_api_name = matching_size.get("name")
+        size_meta_display = matching_size.get("displayCode") or size_display_code
+        size_name = uniqlo_size_label(size_api_name, size_code, size_meta_display)
         stk = stocks.get(l2id, {})
         prc = prices.get(l2id, {})
         status = stk.get("statusCode") or "UNK"
