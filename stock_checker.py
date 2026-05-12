@@ -85,6 +85,36 @@ class ProductResult:
 
 OOS_JP_PATTERNS = re.compile(r"売り切れ|在庫切れ|品切れ|再入荷|入荷待ち|入荷時に通知|SOLD\s*OUT", re.IGNORECASE)
 
+# Uniqlo 색상 코드 매핑 — API 가 colorName 을 null 로 반환할 때 displayCode 로 사람-읽기 좋은 이름 매핑.
+# 시즌마다 색상 코드 의미가 약간씩 바뀔 수 있으니 알 수 없는 코드는 "색상XX" 로 fallback.
+UNIQLO_COLOR_MAP = {
+    "00": "WHITE",      "01": "OFF WHITE",     "02": "NATURAL",
+    "03": "BEIGE",      "04": "BROWN",         "05": "KHAKI",
+    "06": "OLIVE",      "07": "GRAY",          "08": "DARK GRAY",
+    "09": "BLACK",      "10": "PURPLE",        "11": "PINK",
+    "12": "RED",        "13": "BORDEAUX",      "14": "ORANGE",
+    "15": "ORANGE",     "16": "MUSTARD",       "17": "YELLOW",
+    "20": "GREEN",      "22": "GREEN",         "23": "LIGHT GREEN",
+    "24": "GREEN",      "26": "GREEN",         "27": "EMERALD GREEN",
+    "30": "YELLOW",     "32": "DARK YELLOW",   "35": "GOLD",
+    "40": "PEACH",      "50": "PURPLE",        "55": "WINE",
+    "57": "WINE",       "58": "BURGUNDY",
+    "60": "BLUE",       "61": "LIGHT BLUE",    "62": "SKY BLUE",
+    "63": "DARK BLUE",  "64": "BLUE",          "65": "BLUE",
+    "66": "BLUE",       "67": "LIGHT BLUE",    "68": "INDIGO BLUE",
+    "69": "NAVY",       "70": "TURQUOISE",
+}
+
+
+def uniqlo_color_label(color_name: str | None, display_code: str) -> str:
+    """API 의 colorName 우선, 없으면 매핑, 그래도 없으면 '색상XX'."""
+    if color_name:
+        return color_name
+    code = (display_code or "").strip()
+    if code in UNIQLO_COLOR_MAP:
+        return UNIQLO_COLOR_MAP[code]
+    return f"색상{code}" if code else "색상미상"
+
 
 def fetch_nike(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
     """Nike US/JP — __NEXT_DATA__ + JSON-LD ProductGroup."""
@@ -163,8 +193,12 @@ def fetch_uniqlo(url: str, product_no: str, browser, *, config: dict) -> Product
     stocks = (stock.get("result") or {}).get("stocks") or {}
     prices = (stock.get("result") or {}).get("prices") or {}
 
-    def _color_label(color_code: str, pld_code: str) -> str:
-        cname = next((c.get("name") for c in colors if c.get("code") == color_code), color_code)
+    def _color_label(color_code: str, display_code: str, pld_code: str) -> str:
+        # 1. API 가 제공한 colorName 우선 사용
+        cname = next((c.get("name") for c in colors if c.get("code") == color_code), None)
+        # 2. None / 빈 문자열이면 displayCode 기반 매핑 fallback
+        cname = uniqlo_color_label(cname, display_code)
+        # 3. 길이(pld) 메타가 있을 때 색상명 뒤에 표기 (예: "BLUE (65)")
         if not plds or pld_code in ("PTB000", ""):
             return cname
         pname = next((p.get("name") for p in plds if p.get("code") == pld_code), None)
@@ -173,7 +207,11 @@ def fetch_uniqlo(url: str, product_no: str, browser, *, config: dict) -> Product
     by_color: dict[str, ColorResult] = {}
     for l in l2s:
         l2id = l.get("l2Id")
-        color_label = _color_label(l.get("color", {}).get("code"), l.get("pld", {}).get("code", ""))
+        color_label = _color_label(
+            l.get("color", {}).get("code"),
+            l.get("color", {}).get("displayCode", ""),
+            l.get("pld", {}).get("code", ""),
+        )
         size_code = l.get("size", {}).get("code")
         size_name = next((s.get("name") for s in sizes_meta if s.get("code") == size_code), size_code)
         stk = stocks.get(l2id, {})
