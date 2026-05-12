@@ -1,5 +1,5 @@
 {
-  "version": "2.0",
+  "version": "2.1",
   "updated": "2026-05-12",
   "description": "사이트별 추출 설정 — CSS 선택자, OOS 마커, 대기 시간 등",
   "sites": {
@@ -38,6 +38,30 @@
     "adidas.com": {
       "name": "Adidas US",
       "wait_ms": 5500,
+      "redirect_guard": {
+        "problem": "한국 IP / Accept-Language=ko-KR / 사전 쿠키 등으로 adidas.com/us URL 접속이 adidas.co.kr 로 server-redirect 되는 경우 발생. 결과적으로 색상이 'Default'/'GREY' 로 잘못 추출되고 사이즈 표기도 일본/한국 표기로 바뀜.",
+        "context_options": {
+          "locale": "en-US",
+          "timezone_id": "America/New_York",
+          "geolocation": {"latitude": 40.7128, "longitude": -74.006},
+          "permissions": ["geolocation"]
+        },
+        "extra_http_headers": {
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": "https://www.adidas.com/us",
+          "sec-ch-ua-platform": "\"Windows\""
+        },
+        "cookies": [
+          {"name": "geoCountry", "value": "US", "domain": ".adidas.com"},
+          {"name": "geoRedirect", "value": "false", "domain": ".adidas.com"},
+          {"name": "country", "value": "US", "domain": ".adidas.com"},
+          {"name": "locale", "value": "en_US", "domain": ".adidas.com"},
+          {"name": "language", "value": "en", "domain": ".adidas.com"},
+          {"name": "default_country", "value": "US", "domain": ".adidas.com"}
+        ],
+        "network_route_block": ["adidas.co.kr", "adidas.jp"],
+        "post_navigation_check": "urlparse(page.url).netloc 에 'adidas.com' 포함 및 'co.kr' 미포함. 위반 시 result.error 로 표시."
+      },
       "extraction": {
         "source": "JSON-LD Product + DOM 사이즈 버튼",
         "json_ld_selector": "script[type=\"application/ld+json\"]",
@@ -45,7 +69,14 @@
         "oos_class_pattern": "unavailable",
         "size_label_regex": "^[A-Z0-9]{1,4}$",
         "price_path": "offers.price",
-        "currency_path": "offers.priceCurrency"
+        "currency_path": "offers.priceCurrency",
+        "color_fallback_order": [
+          "JSON-LD .color (full name, e.g. 'Pure Tangerine / Pure Orange')",
+          "__NEXT_DATA__ props.pageProps.dehydratedState.queries[0].state.data.attribute_list.color",
+          "title regex '^adidas .+ - (.+) \\| ...' (e.g. 'Orange' from ' - Orange | Free Shipping...')",
+          "__NEXT_DATA__ attribute_list.search_col (짧은 표기)",
+          "'Default'"
+        ]
       }
     },
     "adidas.jp": {
