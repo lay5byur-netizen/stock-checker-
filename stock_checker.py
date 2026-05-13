@@ -316,6 +316,12 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # 사이즈 버튼이 렌더될 때까지 대기 — 안 그러면 size_btns=[] 로 잡혀
+        # '정상' 으로 잘못 표기됨. 12초 안에 안 나오면 시도만 한 채 진행.
+        try:
+            page.wait_for_selector('[class*="size-selector_size__"]', timeout=12000)
+        except Exception:
+            pass
         page.wait_for_timeout(config.get("wait_ms", 5500))
 
         final_host = urlparse(page.url).netloc.lower()
@@ -389,13 +395,45 @@ def _adidas_color_from_title(title: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
+def _adidas_jp_color_from_title(title: str) -> Optional[str]:
+    """'<product> - <Color> | アディダス ジャパン' → '<Color>'.
+
+    Adidas JP 의 title 는 '- ' 로 분리된 색상명이 포함된 패턴. JSON-LD 가 비거나
+    색상이 truncated (e.g. 'Mint Ton') 일 때 fallback 으로 사용.
+    """
+    if not title:
+        return None
+    # 일본어 제목 패턴: "아디다스 <제품명> - <색상> | アディダス ジャパン"
+    m = re.search(r"-\s*([^|\-]+?)\s*\|\s*アディダス", title)
+    if m:
+        return m.group(1).strip()
+    # 영문 제목 패턴: "adidas <product> - <Color> | ..."
+    m = re.search(r"-\s*([^|\-]+?)\s*\|", title)
+    return m.group(1).strip() if m else None
+
+
 def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
-    """Adidas JP — JSON-LD ProductGroup for metadata + DOM 'unavailable' class for OOS."""
+    """Adidas JP — JSON-LD ProductGroup for metadata + DOM 'unavailable' class for OOS.
+
+    색상 추출 fallback 순서:
+      1. 색상 변형 (hasVariant 의 `!v.offers` 항목) 의 첫 번째 `color` 값
+      2. JSON-LD `pg.color` (있는 경우)
+      3. title 의 ' - <Color> | ...' 패턴
+      4. hasVariant[0].color (마지막 fallback)
+      5. 'Default'
+
+    사이즈 검출 전 `[class*="size-selector_size__"]` 가 실제로 렌더될 때까지
+    `page.wait_for_selector` 로 대기 → 사이즈 0개로 잡혀 '정상' 표기 방지.
+    """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(user_agent=DEFAULT_UA, locale="ja-JP")
     try:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            page.wait_for_selector('[class*="size-selector_size__"]', timeout=12000)
+        except Exception:
+            pass  # 사이즈 셀렉터가 없는 상품도 있음 — 진행
         page.wait_for_timeout(config.get("wait_ms", 6000))
         data = page.evaluate(
             """() => {
@@ -405,14 +443,22 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
                 const sizes = Array.from(document.querySelectorAll('[class*="size-selector_size__"]'))
                     .filter(b => { const t = (b.textContent||'').trim(); return t.length > 0 && t.length <= 8 && /\\d|[A-Z]/.test(t); })
                     .map(b => ({size: b.textContent.trim(), cls: String(b.className)}));
-                return {pg, sizes};
+                return {pg, sizes, title: document.title || ''};
             }"""
         )
         pg = data.get("pg") or {}
         size_variants = [v for v in (pg.get("hasVariant") or []) if v.get("offers")]
+        color_variants = [v for v in (pg.get("hasVariant") or []) if not v.get("offers")]
         price = (size_variants[0].get("offers", {}) if size_variants else {}).get("price")
         currency = (size_variants[0].get("offers", {}) if size_variants else {}).get("priceCurrency") or "JPY"
-        color = pg.get("hasVariant", [{}])[0].get("color") or "Default"
+        # 색상 — 다단계 fallback
+        color = (
+            (color_variants[0].get("color") if color_variants else None)
+            or pg.get("color")
+            or _adidas_jp_color_from_title(data.get("title") or "")
+            or (pg.get("hasVariant", [{}])[0].get("color") if pg.get("hasVariant") else None)
+            or "Default"
+        )
         sizes = []
         for s in data["sizes"]:
             oos = "unavailable" in (s.get("cls") or "")
