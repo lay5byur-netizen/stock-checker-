@@ -119,3 +119,4 @@ git push -u origin main
 | Playwright 실패 | 로그에서 `playwright install chromium --with-deps` 단계 확인 |
 | 가격 통화 이상 | `site_config.json` 의 currency 설정 확인 |
 | 새 OOS 마커 못 잡음 (Rakuten) | `stock_checker.py` 의 `OOS_JP_PATTERNS` 정규식에 추가 |
+
