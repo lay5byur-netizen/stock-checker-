@@ -3,9 +3,9 @@ name: Stock Checker - C Grade
 on:
   schedule:
     # 화요일 15:00 KST (06:00 UTC)
-    - cron: '0 6 * * 2'
+    - cron: '15 6 * * 2'   # 화요일 15:15 KST
     # 토요일 15:00 KST (06:00 UTC)
-    - cron: '0 6 * * 6'
+    - cron: '15 6 * * 6'   # 토요일 15:15 KST
   workflow_dispatch:
 
 jobs:
