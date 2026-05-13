@@ -3,7 +3,7 @@ name: Stock Checker - B Grade
 on:
   schedule:
     # 매일 07:00 KST (22:00 UTC 전날)
-    - cron: '0 22 * * *'
+    - cron: '10 22 * * *'   # KST 07:10 (A와 충돌 방지)
   workflow_dispatch:
 
 jobs:
