@@ -358,7 +358,7 @@
                 <div class="stat-value" id="urgentCount">-</div>
             </div>
             <div class="stat-card restock" onclick="filterItems('restock')">
-                <div class="stat-label">🎉 재입고 알림</div>
+                <div class="stat-label">🟢 재입고 알림</div>
                 <div class="stat-value" id="restockCount">-</div>
             </div>
             <div class="stat-card warning" onclick="filterItems('warning')">
@@ -376,9 +376,10 @@
             <div class="tabs">
                 <button class="tab active" onclick="filterItems('all')">전체</button>
                 <button class="tab" onclick="filterItems('urgent')">🔴 긴급</button>
-                <button class="tab" onclick="filterItems('restock')">🎉 재입고</button>
+                <button class="tab" onclick="filterItems('restock')">🟢 재입고</button>
+                <button class="tab" onclick="filterItems('oos')">🟣 계속 품절</button>
                 <button class="tab" onclick="filterItems('warning')">⚠️ 부족</button>
-                <button class="tab" onclick="filterItems('normal')">✅ 정상</button>
+                <button class="tab" onclick="filterItems('normal')">🔵 정상</button>
             </div>
         </div>
 
@@ -473,10 +474,14 @@
 
         // 아이템 상태 판별
         function getItemStatus(stock) {
+            // 새 표기 (2026-05-14~): 🔴 신규품절 / 🟢 재입고 / 🟣 계속품절 / ⚫ 첫등록 전OOS
+            //                       / 🟤 첫등록 일부OOS / 🔵 정상 / ⚠️ 재고적음
+            // 레거시: 🎉 재입고 / 🟠 계속품절 / ✅ 정상 — 하위 호환
             if (!stock) return 'normal';
             const stockStr = String(stock);
-            if (stockStr.startsWith('🔴')) return 'urgent';
-            if (stockStr.startsWith('🎉')) return 'restock';
+            if (stockStr.startsWith('⚫') || stockStr.startsWith('🔴')) return 'urgent';
+            if (stockStr.startsWith('🟢') || stockStr.startsWith('🎉')) return 'restock';
+            if (stockStr.startsWith('🟣') || stockStr.startsWith('🟠') || stockStr.startsWith('🟤')) return 'oos';
             if (stockStr.startsWith('⚠️')) return 'warning';
             return 'normal';
         }
@@ -585,9 +590,10 @@
             if (filter !== 'all') {
                 const tabTexts = {
                     urgent: '🔴 긴급',
-                    restock: '🎉 재입고',
+                    restock: '🟢 재입고',
+                    oos: '🟣 계속 품절',
                     warning: '⚠️ 부족',
-                    normal: '✅ 정상'
+                    normal: '🔵 정상'
                 };
                 const targetTab = Array.from(document.querySelectorAll('.tab')).find(
                     tab => tab.textContent === tabTexts[filter]
