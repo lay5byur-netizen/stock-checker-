@@ -64,12 +64,12 @@ stock-checker/
 
 **재고 (D 컬럼) — 간소화 표기**
 - `🔴 [size]` — 신규 품절 (이전 IN_STOCK → 오늘 OOS, 긴급)
-- `🟠 [size] 계속 품절` — 이전 OOS → 오늘 OOS
+- `🟣 [size]` — 계속 품절 (이전 OOS → 오늘 OOS)
 - `🟢 [size]` — 재입고 (이전 OOS → 오늘 IN_STOCK)
 - `⚫` — 첫등록 + 전 사이즈 OOS
 - `🟤 [size]` — 첫등록 + 일부 OOS
 - `⚠️ [size] ([qty])` — 재고 적음 (Uniqlo LOW_STOCK 또는 qty ≤ 3)
-- `✅ 정상` — 변동 없음
+- `🔵` — 변동 없음 (정상)
 
 **가격 (E 컬럼)**
 - 첫 등록 또는 ±2% 미만 → `현재가` 만 기록

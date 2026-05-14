@@ -728,8 +728,8 @@ def parse_price_str(s: str):
 def parse_prev_oos(prev_d: str) -> set[str]:
     """이전 D열 텍스트에서 OOS 사이즈 집합을 추출.
 
-    인식 마커: 🔴 (신규 품절) · 🟠 (계속 품절) · 🟤 (첫등록 일부 품절)
-    하위 호환: 레거시 키워드 "품절" · "OOS" 도 인식.
+    인식 마커: 🔴 (신규 품절) · 🟣 (계속 품절) · 🟤 (첫등록 일부 품절)
+    하위 호환: 레거시 마커 🟠 (이전 '계속 품절' 표기) · 키워드 "품절" · "OOS" 도 인식.
     ⚫ (첫등록 전체 품절) 은 사이즈 정보가 없으므로 sentinel `__ALL__` 반환.
     ⚠️ 만 있는 (재고 적음) 파트는 스킵.
     """
@@ -740,7 +740,7 @@ def parse_prev_oos(prev_d: str) -> set[str]:
     result = set()
     parts = re.split(r"/", prev_d)
     for part in parts:
-        has_oos_marker = ("🔴" in part) or ("🟠" in part) or ("🟤" in part)
+        has_oos_marker = ("🔴" in part) or ("🟣" in part) or ("🟠" in part) or ("🟤" in part)
         has_legacy_kw = ("품절" in part) or ("OOS" in part.upper())
         if not (has_oos_marker or has_legacy_kw):
             continue
@@ -768,9 +768,9 @@ def classify_stock(prev_d: str, sizes: list[SizeVariant]):
       - 첫등록 + 일부 OOS       → "🟤 sizes"
       - 신규 품절                → "🔴 sizes"
       - 재입고                   → "🟢 sizes"
-      - 계속 품절                → "🟠 sizes 계속 품절"
+      - 계속 품절                → "🟣 sizes"
       - 재고 적음 (qty ≤ 3)      → "⚠️ size (N), ..."
-      - 변동 없음                → "✅ 정상"
+      - 변동 없음                → "🔵"
     """
     today_oos = {s.size for s in sizes if s.status == S.OUT_OF_STOCK}
     today_in = {s.size for s in sizes if s.status == S.IN_STOCK}
@@ -811,12 +811,12 @@ def classify_stock(prev_d: str, sizes: list[SizeVariant]):
     if restocked:
         parts.append(f"🟢 {', '.join(restocked)}"); color = color or COLOR_RESTOCK
     if cont_oos:
-        parts.append(f"🟠 {', '.join(cont_oos)} 계속 품절"); color = color or COLOR_CONT_OOS
+        parts.append(f"🟣 {', '.join(cont_oos)}"); color = color or COLOR_CONT_OOS
     if low_sizes:
         parts.append("⚠️ " + ", ".join(f"{s} ({qmap.get(s, 0)})" for s in low_sizes))
         color = color or COLOR_LOW
     if not parts:
-        return "✅ 정상", None, [], []
+        return "🔵", None, [], []
     return " / ".join(parts), color, new_oos, restocked
 
 
