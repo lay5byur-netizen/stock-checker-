@@ -1,15 +1,19 @@
-name: Schedule C (C등급 화/토 15:00 KST)
+name: Schedule C (C등급 매일 10:44 KST, 직전 실행 < 72h이면 skip)
+
+# 매일 10:44 KST 트리거. "사용량 모니터링" 시트의 가장 최근 slot=schedule-C 기록을 읽어서
+# 72시간 이내라면 즉시 종료. 결과적으로 정확히 3일 간격 실행.
 
 on:
   schedule:
-    # KST 화요일 15:00 = UTC 월요일 06:00
-    # KST 토요일 15:00 = UTC 금요일 06:00
-    # cron 요일: SUN=0, MON=1, TUE=2, WED=3, THU=4, FRI=5, SAT=6
-    - cron: "0 6 * * 1,5"
-  workflow_dispatch:
+    # 10:44 KST = 01:44 UTC, daily
+    - cron: '44 1 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 concurrency:
-  group: stock-check
+  group: schedule-c
   cancel-in-progress: false
 
 jobs:
@@ -21,25 +25,68 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
-        run: |
-          python -m playwright install chromium --with-deps
-
-      - name: Run stock check (Grade C)
+      - name: Skip if last run < 72h ago
+        id: gate
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          SLOT_NAME: weekly-C
+        run: |
+          python - <<'PY'
+          import json, os, re, datetime, sys
+          import gspread
+          from google.oauth2.service_account import Credentials
+          creds = Credentials.from_service_account_info(
+              json.loads(os.environ['GOOGLE_CREDENTIALS']),
+              scopes=['https://www.googleapis.com/auth/spreadsheets',
+                      'https://www.googleapis.com/auth/drive.readonly'])
+          gc = gspread.authorize(creds)
+          sh = gc.open_by_key(os.environ['GOOGLE_SHEET_ID'])
+          try:
+              ws = sh.worksheet('사용량 모니터링')
+          except gspread.WorksheetNotFound:
+              print('no usage sheet — proceed'); sys.exit(0)
+          slot = 'schedule-C'
+          skip_h = 72
+          latest = None
+          for row in ws.get_all_values():
+              if f'slot={slot}' not in ' '.join(row):
+                  continue
+              for cell in row:
+                  m = re.search(r'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?)', cell)
+                  if m:
+                      try:
+                          t = datetime.datetime.fromisoformat(m.group(1).replace(' ', 'T'))
+                          if latest is None or t > latest:
+                              latest = t
+                      except ValueError:
+                          pass
+          if latest is not None:
+              el = (datetime.datetime.now() - latest).total_seconds() / 3600
+              if el < skip_h:
+                  print(f'[schedule-C] SKIP — last run {el:.1f}h ago (< {skip_h}h)')
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                      f.write('skip=true\n')
+                  sys.exit(0)
+              print(f'[schedule-C] proceed — last run {el:.1f}h ago')
+          else:
+              print('[schedule-C] no prior log — first run')
+          PY
+
+      - name: Run stock checker — grade C
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
-        run: python stock_checker.py --grades C --slot "$SLOT_NAME"
+        run: |
+          python stock_checker.py --grades C --slot schedule-C
