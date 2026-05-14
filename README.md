@@ -17,11 +17,14 @@
 
 ## 스케줄
 
-| 등급 | 실행 시간 (KST) | UTC cron | 워크플로 |
-|---|---|---|---|
-| **A** | 매일 07:00, 18:00 | `0 22 * * *` / `0 9 * * *` | `schedule-a.yml` |
-| **B** | 매일 07:00 (A 10분 후) | `10 22 * * *` | `schedule-b.yml` |
-| **C** | 화/토 15:00 | `0 6 * * 1,5` | `schedule-c.yml` |
+| 등급 | 실행 시간 (KST) | UTC cron | Skip 게이트 | 워크플로 |
+|---|---|---|---|---|
+| **A** | 매일 09:41 | `41 0 * * *` | 없음 (매일 실행) | `schedule-a.yml` |
+| **B** | 매일 10:44 | `44 1 * * *` | 직전 실행 < 48h이면 skip (실효 2일 간격) | `schedule-b.yml` |
+| **C** | 매일 10:44 | `44 1 * * *` | 직전 실행 < 72h이면 skip (실효 3일 간격) | `schedule-c.yml` |
+
+> GitHub Actions cron은 UTC 기준이며, 부하 분산 차원에서 실제 실행이 5~15분 늦춰지는 일이 있습니다.
+> Skip 게이트는 "사용량 모니터링" 시트의 `slot=schedule-X` 마지막 timestamp를 읽어 판단합니다.
 
 ## 파일 구조
 
@@ -33,9 +36,9 @@ stock-checker/
 ├── .gitignore
 ├── README.md
 └── .github/workflows/
-    ├── schedule-a.yml          # A등급 (매일 07:00, 18:00 KST)
-    ├── schedule-b.yml          # B등급 (매일 07:00 KST)
-    └── schedule-c.yml          # C등급 (화/토 15:00 KST)
+    ├── schedule-a.yml          # A등급 (매일 09:41 KST)
+    ├── schedule-b.yml          # B등급 (매일 10:44 KST + 48h skip)
+    └── schedule-c.yml          # C등급 (매일 10:44 KST + 72h skip)
 ```
 
 ## GitHub Secrets
@@ -43,11 +46,11 @@ stock-checker/
 | Secret | 필수 | 설명 |
 |---|---|---|
 | `GOOGLE_CREDENTIALS` | ✅ | 서비스 계정 JSON 전체 (`{` 부터 `}` 까지) |
-| `GOOGLE_SHEET_ID` | ✅ | `1rGBFWaN3DVq41DtcVgc0aM5LVDTXNzpg5LmYeJGzpRc` |
+| `GOOGLE_SHEET_ID` | ✅ | 본인 구글 시트 ID (URL의 `/d/<여기>/edit` 부분) |
 | `SMTP_HOST` | 선택 | 이메일 알림용 — 예: `smtp.gmail.com` |
 | `SMTP_USER` | 선택 | 발신 계정 이메일 |
-| `SMTP_PASS` | 선택 | 발신 앱 비밀번호 (Gmail 은 [앱 비밀번호](https://myaccount.google.com/apppasswords)) |
-| `ALERT_TO` | 선택 | 수신자 이메일 (기본: `lay5byur@gmail.com`) |
+| `SMTP_PASS` | 선택 | 발신 앱 비밀번호 (Gmail은 [앱 비밀번호](https://myaccount.google.com/apppasswords)) |
+| `ALERT_TO` | 선택 | 수신자 이메일 (예: `<your-email@example.com>`) |
 
 ## 시트 구조
 
@@ -83,7 +86,7 @@ pip install -r requirements.txt
 python -m playwright install chromium
 
 export GOOGLE_CREDENTIALS="$(cat /path/to/service_account.json)"
-export GOOGLE_SHEET_ID="1rGBFWaN3DVq41DtcVgc0aM5LVDTXNzpg5LmYeJGzpRc"
+export GOOGLE_SHEET_ID="<YOUR_SHEET_ID>"
 
 # 시트 안 건드리고 결과만 출력 (dry-run)
 python stock_checker.py --grades A --slot manual --dry-run
@@ -117,7 +120,9 @@ git push -u origin main
 |---|---|
 | 워크플로 60일 후 멈춤 | GitHub 정책 — 가벼운 commit 한 번 해주면 재활성화 |
 | `permission denied` (시트) | 서비스 계정 이메일을 시트의 편집자로 추가 |
-| `JSONDecodeError` (GOOGLE_CREDENTIALS) | Secret 에 JSON 전체 (`{...}`) 그대로 붙여넣기 |
-| Playwright 실패 | 로그에서 `playwright install chromium --with-deps` 단계 확인 |
-| 가격 통화 이상 | `site_config.json` 의 currency 설정 확인 |
-| 새 OOS 마커 못 잡음 (Rakuten) | `stock_checker.py` 의 `OOS_JP_PATTERNS` 정규식에 추가 |
+| `JSONDecodeError` (GOOGLE_CREDENTIALS) | Secret에 JSON 전체 (`{...}`) 그대로 붙여넣기 |
+| `ModuleNotFoundError: gspread` (skip 게이트) | `Install Python deps` 단계에 `pip install gspread google-auth` 한 줄 포함 |
+| Playwright 실패 | YAML에 `python -m playwright install --with-deps chromium` 단계 있는지 확인 |
+| 가격 통화 이상 | `site_config.json`의 currency 설정 확인 |
+| 새 OOS 마커 못 잡음 (Rakuten) | `stock_checker.py`의 `OOS_JP_PATTERNS` 정규식에 추가 |
+| 6시간 타임아웃 초과 (B 등급 1000개+) | 매트릭스 병렬 도입 — `stock_checker.py` 에 `--chunk-index N --chunk-total M` 추가 후 YAML에 `strategy.matrix.chunk` 적용 |
