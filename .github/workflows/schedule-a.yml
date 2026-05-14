@@ -2,7 +2,7 @@ name: Schedule A (A등급 매일 07:00, 18:00 KST)
 
 on:
   schedule:
-    - cron: '13 22 * * *'   # KST 07:13 (정시 부하 회피)
+    - cron: '13 22 * * *'   # KST 07:13 (정상 부하 회피)
     - cron: '23 9 * * *'    # KST 18:23
   workflow_dispatch:
 
@@ -31,22 +31,12 @@ jobs:
         run: |
           python -m playwright install chromium --with-deps
 
-      - name: Determine slot label
-        id: slot
-        run: |
-          if [ "$(date -u +%H)" = "22" ]; then
-            echo "label=morning-A" >> "$GITHUB_OUTPUT"
-          else
-            echo "label=evening-A" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Run stock check (Grade A)
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          SLOT_NAME: ${{ steps.slot.outputs.label }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
-        run: python stock_checker.py --grades A --slot "$SLOT_NAME"
+        run: python stock_checker.py --grades A
