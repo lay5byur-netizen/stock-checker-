@@ -37,7 +37,8 @@
     },
     "adidas.com": {
       "name": "Adidas US",
-      "wait_ms": 5500,
+      "wait_ms": 8000,
+      "_v2.2_fix": "2026-05-14: headless 환경에서 페이지 렌더가 늦어 사이즈/JSON-LD 추출이 빈 결과로 잡혀 시트에 'Default ✅ 정상' 으로 덮어쓰는 문제 발생. wait_for_function('script[ld+json]') + wait_for_selector size-selector + wait_ms 5500→8000 으로 보강. 빈 결과는 r.error 처리로 시트 업데이트 skip.",
       "redirect_guard": {
         "problem": "한국 IP / Accept-Language=ko-KR / 사전 쿠키 등으로 adidas.com/us URL 접속이 adidas.co.kr 로 server-redirect 되는 경우 발생. 결과적으로 색상이 'Default'/'GREY' 로 잘못 추출되고 사이즈 표기도 일본/한국 표기로 바뀜.",
         "context_options": {
@@ -81,7 +82,8 @@
     },
     "adidas.jp": {
       "name": "Adidas JP",
-      "wait_ms": 6000,
+      "wait_ms": 8000,
+      "_v2.2_fix": "2026-05-14: adidas.com 과 같은 빈 결과 문제. wait_for_function(ProductGroup 검출) + wait_ms 6000→8000 + 빈 결과 가드 추가.",
       "extraction": {
         "source": "JSON-LD ProductGroup + DOM 사이즈 버튼 (DOM 우선)",
         "json_ld_type": "ProductGroup",

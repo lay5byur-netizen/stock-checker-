@@ -278,6 +278,9 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
     색상은 JSON-LD `color` (full name, e.g. 'Pure Tangerine / Pure Orange') →
     title 패턴 ('adidas <name> - <Color> | ...') → __NEXT_DATA__ 의
     `attribute_list.color` 순으로 fallback 한다.
+
+    빈 결과 가드: JSON-LD 미수신 + 사이즈 버튼 0개 + 가격 None 이면 페이지 렌더 실패로 간주하고
+    `r.error` 로 표시. 이 경우 main 흐름에서 시트 업데이트가 skip 되어 옛 데이터를 보존한다.
     """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(
@@ -316,13 +319,24 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # 사이즈 버튼이 렌더될 때까지 대기 — 안 그러면 size_btns=[] 로 잡혀
-        # '정상' 으로 잘못 표기됨. 12초 안에 안 나오면 시도만 한 채 진행.
+        # JSON-LD 가 DOM 에 채워질 때까지 명시적으로 대기 (가장 신뢰성 있는 마커).
+        # JSON-LD 가 비어 있으면 SSR/CSR 모두 미완료 → 추출 실패가 확실.
         try:
-            page.wait_for_selector('[class*="size-selector_size__"]', timeout=12000)
+            page.wait_for_function(
+                """() => {
+                    const s = document.querySelector('script[type="application/ld+json"]');
+                    return s && s.textContent && s.textContent.length > 100;
+                }""",
+                timeout=20000,
+            )
         except Exception:
             pass
-        page.wait_for_timeout(config.get("wait_ms", 5500))
+        # 사이즈 버튼 렌더 대기 (없는 상품도 있어서 실패해도 진행).
+        try:
+            page.wait_for_selector('[class*="size-selector_size__"]', timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(config.get("wait_ms", 8000))
 
         final_host = urlparse(page.url).netloc.lower()
         if "adidas.com" not in final_host or "co.kr" in final_host:
@@ -375,6 +389,13 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
                 continue
             oos = "unavailable" in (s.get("cls") or "")
             sizes.append(SizeVariant(t, S.OUT_OF_STOCK if oos else S.IN_STOCK, 0 if oos else 1))
+
+        # 빈 결과 가드 — JSON-LD 비어있고 사이즈도 0이고 가격도 없으면 페이지 렌더 실패.
+        # 시트의 옛 데이터를 망가뜨리지 않도록 error 표시 후 종료.
+        if not ld and not sizes and price is None:
+            r.error = f"adidas_us empty result (page render failed at {final_host})"
+            return r
+
         r.colors.append(ColorResult(color=color, sizes=sizes, price=price, currency=currency))
     except Exception as e:
         r.error = f"adidas_us error: {e}"
@@ -430,11 +451,26 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
     try:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # ProductGroup JSON-LD 가 DOM 에 들어올 때까지 명시적 대기. headless 환경에서 페이지
+        # 렌더가 늦어 빈 결과가 시트의 옛 데이터를 망가뜨리는 문제 방지.
         try:
-            page.wait_for_selector('[class*="size-selector_size__"]', timeout=12000)
+            page.wait_for_function(
+                """() => {
+                    const ss = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const s of ss) {
+                        try { const j = JSON.parse(s.textContent); if (j && j['@type'] === 'ProductGroup') return true; } catch(e) {}
+                    }
+                    return false;
+                }""",
+                timeout=20000,
+            )
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector('[class*="size-selector_size__"]', timeout=15000)
         except Exception:
             pass  # 사이즈 셀렉터가 없는 상품도 있음 — 진행
-        page.wait_for_timeout(config.get("wait_ms", 6000))
+        page.wait_for_timeout(config.get("wait_ms", 8000))
         data = page.evaluate(
             """() => {
                 const lds = document.querySelectorAll('script[type="application/ld+json"]');
@@ -463,6 +499,12 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
         for s in data["sizes"]:
             oos = "unavailable" in (s.get("cls") or "")
             sizes.append(SizeVariant(s["size"], S.OUT_OF_STOCK if oos else S.IN_STOCK, 0 if oos else 1))
+
+        # 빈 결과 가드 — ProductGroup 없고 사이즈도 0이고 가격도 없으면 페이지 렌더 실패로 판정.
+        if not pg and not sizes and price is None:
+            r.error = f"adidas_jp empty result (page render failed)"
+            return r
+
         r.colors.append(ColorResult(color=color, sizes=sizes, price=price, currency=currency))
     except Exception as e:
         r.error = f"adidas_jp error: {e}"
