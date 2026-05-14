@@ -1,0 +1,188 @@
+{
+  "version": "2.1",
+  "updated": "2026-05-12",
+  "description": "사이트별 추출 설정 — CSS 선택자, OOS 마커, 대기 시간 등",
+  "sites": {
+    "nike.com": {
+      "name": "Nike (US/JP)",
+      "wait_ms": 6500,
+      "extraction": {
+        "source": "__NEXT_DATA__ + JSON-LD ProductGroup",
+        "next_data_selector": "#__NEXT_DATA__",
+        "json_ld_selector": "script[type=\"application/ld+json\"]",
+        "selected_product_path": "props.pageProps.selectedProduct",
+        "colorway_images_path": "props.pageProps.colorwayImages",
+        "all_sizes_field": "sel.sizes[].label",
+        "in_stock_logic": "JSON-LD hasVariant 필터 후 offers.availability InStock 인 사이즈 = IN_STOCK; sel.sizes 에 있지만 JSON-LD 에 없는 사이즈 = OUT_OF_STOCK",
+        "price_field": "hasVariant[0].offers.price",
+        "currency_field": "hasVariant[0].offers.priceCurrency"
+      }
+    },
+    "uniqlo.com": {
+      "name": "Uniqlo JP",
+      "wait_ms": 0,
+      "extraction": {
+        "source": "공개 commerce API v5",
+        "product_api": "https://www.uniqlo.com/jp/api/commerce/v5/ja/products?productIds={pid}",
+        "stock_api": "https://www.uniqlo.com/jp/api/commerce/v5/ja/products/{pid}/price-groups/00/l2s?withPrices=true&withStocks=true",
+        "id_regex": "/products/(E\\d{6}-\\d{3})",
+        "status_codes": {
+          "IN_STOCK": "재고 있음",
+          "LOW_STOCK": "qty 적음 → ⚠️ 매핑",
+          "STOCK_OUT": "OOS"
+        },
+        "low_stock_threshold": 3,
+        "currency": "JPY"
+      }
+    },
+    "adidas.com": {
+      "name": "Adidas US",
+      "wait_ms": 5500,
+      "redirect_guard": {
+        "problem": "한국 IP / Accept-Language=ko-KR / 사전 쿠키 등으로 adidas.com/us URL 접속이 adidas.co.kr 로 server-redirect 되는 경우 발생. 결과적으로 색상이 'Default'/'GREY' 로 잘못 추출되고 사이즈 표기도 일본/한국 표기로 바뀜.",
+        "context_options": {
+          "locale": "en-US",
+          "timezone_id": "America/New_York",
+          "geolocation": {"latitude": 40.7128, "longitude": -74.006},
+          "permissions": ["geolocation"]
+        },
+        "extra_http_headers": {
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer": "https://www.adidas.com/us",
+          "sec-ch-ua-platform": "\"Windows\""
+        },
+        "cookies": [
+          {"name": "geoCountry", "value": "US", "domain": ".adidas.com"},
+          {"name": "geoRedirect", "value": "false", "domain": ".adidas.com"},
+          {"name": "country", "value": "US", "domain": ".adidas.com"},
+          {"name": "locale", "value": "en_US", "domain": ".adidas.com"},
+          {"name": "language", "value": "en", "domain": ".adidas.com"},
+          {"name": "default_country", "value": "US", "domain": ".adidas.com"}
+        ],
+        "network_route_block": ["adidas.co.kr", "adidas.jp"],
+        "post_navigation_check": "urlparse(page.url).netloc 에 'adidas.com' 포함 및 'co.kr' 미포함. 위반 시 result.error 로 표시."
+      },
+      "extraction": {
+        "source": "JSON-LD Product + DOM 사이즈 버튼",
+        "json_ld_selector": "script[type=\"application/ld+json\"]",
+        "size_button_selector": "[class*=\"size-selector_size__\"]",
+        "oos_class_pattern": "unavailable",
+        "size_label_regex": "^[A-Z0-9]{1,4}$",
+        "price_path": "offers.price",
+        "currency_path": "offers.priceCurrency",
+        "color_fallback_order": [
+          "JSON-LD .color (full name, e.g. 'Pure Tangerine / Pure Orange')",
+          "__NEXT_DATA__ props.pageProps.dehydratedState.queries[0].state.data.attribute_list.color",
+          "title regex '^adidas .+ - (.+) \\| ...' (e.g. 'Orange' from ' - Orange | Free Shipping...')",
+          "__NEXT_DATA__ attribute_list.search_col (짧은 표기)",
+          "'Default'"
+        ]
+      }
+    },
+    "adidas.jp": {
+      "name": "Adidas JP",
+      "wait_ms": 6000,
+      "extraction": {
+        "source": "JSON-LD ProductGroup + DOM 사이즈 버튼 (DOM 우선)",
+        "json_ld_type": "ProductGroup",
+        "has_variant_size_filter": "v.offers 가 있는 것만 사이즈 변형",
+        "has_variant_color_filter": "v.offers 가 없는 것은 색상 변형 (productId 로 다른 색상 URL)",
+        "size_button_selector": "[class*=\"size-selector_size__\"]",
+        "oos_class_pattern": "unavailable",
+        "note": "JSON-LD availability 가 모두 InStock 으로 잘못 표시될 수 있음 — DOM 클래스로 판정",
+        "size_label_patterns": ["XX.Xcm (신발)", "J/XS, J/S, J/M ... (의류)"],
+        "currency": "JPY"
+      }
+    },
+    "swim2000.com": {
+      "name": "Swim2000 (Shopify)",
+      "wait_ms": 0,
+      "extraction": {
+        "source": "Shopify /products/<handle>.js endpoint",
+        "handle_regex": "/products/([^/?#]+)",
+        "url_template": "https://www.swim2000.com/products/{handle}.js",
+        "variant_fields": {
+          "color": "option1",
+          "size": "option2",
+          "available": "available (boolean)",
+          "price": "price (cents)"
+        },
+        "currency": "USD"
+      }
+    },
+    "top4running.de": {
+      "name": "Top4Running.de",
+      "wait_ms": 4000,
+      "extraction": {
+        "source": "JSON-LD ProductGroup (array 형태)",
+        "json_ld_selector": "script[type=\"application/ld+json\"]",
+        "json_ld_array_wrapper": true,
+        "json_ld_type": "ProductGroup",
+        "size_in": "hasVariant[].offers.url 의 ?size= 쿼리 파라미터",
+        "size_extract": "URL.searchParams.get('size').toUpperCase()",
+        "availability_path": "offers.availability (endsWith InStock / OutOfStock)",
+        "price_strategy": "first IN_STOCK 변형의 price",
+        "currency": "EUR",
+        "dom_fallback_oos": {
+          "size_button_selector": ".detail-size__btn",
+          "oos_class_pattern": "is-disabled|js-detail-size-no-item"
+        }
+      }
+    },
+    "runningwarehouse.com": {
+      "name": "Running Warehouse",
+      "wait_ms": 4500,
+      "extraction": {
+        "source": "schema.org/Offer microdata",
+        "key_insight": "OOS 사이즈는 DOM 에 렌더되지 않음 — 화면에 보이는 사이즈 = 모두 IN_STOCK",
+        "product_selector": "[itemtype*=\"Product\"]",
+        "offer_selector": "[itemtype*=\"Offer\"]",
+        "color_selector": "[class*=\"style_ordering-image_wrap\"] img",
+        "color_attr": "alt",
+        "size_regex_in_itemOffered": "\\b(XXS|XS|S|M|L|XL|XXL|XXXL|2XL|3XL|4XL|\\d{1,2}(?:\\.\\d)?)\\b",
+        "price_meta": "meta[itemprop=\"price\"]",
+        "currency_meta": "meta[itemprop=\"priceCurrency\"]",
+        "all_listed_are_in_stock": true
+      }
+    },
+    "rakuten.co.jp": {
+      "name": "Rakuten (item.rakuten.co.jp)",
+      "wait_ms": 5500,
+      "extraction": {
+        "source": "DOM 변형 그리드 버튼 + 통합 OOS 정규식",
+        "grid_selector": "[class*=\"grid-cols-\"]",
+        "grid_filter": "<button> 2개 이상이고 그 텍스트가 '<label><price>円' 패턴",
+        "variant_button_tag": "button",
+        "button_text_pattern": "<label><price>円[<OOS-marker>]",
+        "label_extract_js": "txt.split(/[\\d,]+円/)[0].trim()",
+        "price_regex": "([\\d,]+)円",
+        "oos_marker_regex": "/売り切れ|在庫切れ|品切れ|再入荷|入荷待ち|入荷時に通知|SOLD\\s*OUT/i",
+        "variant_type_source": "inline script variantSelectors[0].key (예: 'サイズ', 'カラー')",
+        "supported_patterns": {
+          "size_variants": "key='サイズ' — 의류 류, 1 색상에 사이즈 여러 개",
+          "color_variants": "key='カラー' — 가방/단일사이즈 제품, 색상 여러 개"
+        },
+        "currency": "JPY",
+        "note": "disabled / aria-disabled 신뢰 불가 — 모두 false. 버튼 텍스트의 OOS 마커가 유일한 신뢰 source."
+      }
+    }
+  },
+  "global": {
+    "price_change_threshold_pct": 2.0,
+    "low_stock_qty_threshold": 3,
+    "cell_colors": {
+      "new_oos": "#F4CCCC",
+      "restock": "#D9EAD3",
+      "continuing_oos": "#FCE5CD",
+      "low_stock": "#FFF2CC",
+      "price_down": "#CFE2F3",
+      "price_up": "#F4CCCC"
+    },
+    "currencies_format": {
+      "USD": "$<int> 또는 $<float.2>",
+      "JPY": "¥<thousands-comma>",
+      "EUR": "€<float.2> (trailing zeros 제거)",
+      "KRW": "₩<thousands-comma>"
+    }
+  }
+}

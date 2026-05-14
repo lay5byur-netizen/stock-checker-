@@ -1,0 +1,45 @@
+name: Schedule C (C등급 화/토 15:00 KST)
+
+on:
+  schedule:
+    # KST 화요일 15:00 = UTC 월요일 06:00
+    # KST 토요일 15:00 = UTC 금요일 06:00
+    # cron 요일: SUN=0, MON=1, TUE=2, WED=3, THU=4, FRI=5, SAT=6
+    - cron: "0 6 * * 1,5"
+  workflow_dispatch:
+
+concurrency:
+  group: stock-check
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install chromium --with-deps
+
+      - name: Run stock check (Grade C)
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SLOT_NAME: weekly-C
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_TO: ${{ secrets.ALERT_TO }}
+        run: python stock_checker.py --grades C --slot "$SLOT_NAME"
