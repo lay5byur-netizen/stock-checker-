@@ -81,12 +81,12 @@ class ProductResult:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 재시도 헬퍼 (PATCH 2)
+# 재시도 헬퍼
 # ──────────────────────────────────────────────────────────────────────
 def _retry_fetch(fetcher_fn, url, product_no, browser, config, max_retries=2):
     """첫 시도 실패(error 가 'empty result' 또는 'page render failed' 등) 시 한 번 더 시도.
 
-    GitHub Actions IP 에서 adidas 가 종종 첫 요청을 빈 응답으로 throttle 하는 문제,
+    GitHub Actions IP 에서 일부 사이트가 첫 요청을 빈 응답으로 throttle 하는 문제,
     top4running 의 navigation race 같은 일시적 실패를 우회한다.
     재시도할 가치가 있는 에러 패턴만 재시도하고, 명확한 코드 에러는 즉시 반환.
     """
@@ -105,6 +105,142 @@ def _retry_fetch(fetcher_fn, url, product_no, browser, config, max_retries=2):
             print(f"    [retry] attempt {attempt+1} failed ({result.error[:60]}); retrying in 3s...", flush=True)
             time.sleep(3)
     return last
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Adidas 내부 JSON API helper (PATCH 4 — API-first)
+# ──────────────────────────────────────────────────────────────────────
+# 같은 run 안에서 adidas 도메인 별 세션을 재사용 → 매번 cold start 로 인한 429 방지.
+_ADIDAS_SESSIONS: dict[str, requests.Session] = {}
+
+
+def _get_adidas_session(base_url: str) -> requests.Session:
+    """adidas 도메인 별 requests.Session 재사용. 첫 호출 시 홈페이지 GET 으로 cookie 확보."""
+    if base_url in _ADIDAS_SESSIONS:
+        return _ADIDAS_SESSIONS[base_url]
+    sess = requests.Session()
+    locale = "en-US,en;q=0.9" if "adidas.com" in base_url else "ja-JP,ja;q=0.9,en;q=0.8"
+    sess.headers.update({
+        "User-Agent": DEFAULT_UA,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": locale,
+        "Referer": base_url + "/",
+        "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    })
+    # 홈페이지 한 번 방문해서 기본 쿠키 (geoCountry, locale 등) 확보
+    try:
+        sess.get(base_url + "/", timeout=15)
+        time.sleep(0.5)
+    except Exception:
+        pass  # 실패해도 진행 — API 가 cookie 없이도 응답할 수 있음
+    _ADIDAS_SESSIONS[base_url] = sess
+    return sess
+
+
+def _adidas_api_fetch(pid: str, base_url: str, currency: str,
+                      product_no: str, source_url: str,
+                      preferred_color_field: str = "color") -> ProductResult:
+    """adidas 의 내부 JSON API 로 product + availability 정보를 한 번에 가져온다.
+
+    Endpoints (same-origin only):
+      GET {base_url}/api/products/{PID}              → name, attribute_list.color/search_color, pricing_information
+      GET {base_url}/api/products/{PID}/availability → variation_list[{size, availability, availability_status}]
+
+    이점:
+      - SPA 렌더 대기 불필요 → headless 봇 감지 우회
+      - 사이즈별 정확한 qty 제공 (LOW_STOCK 자동 판별 가능)
+      - 호출 시간 수 초 → 수백 ms 로 단축
+
+    실패 시 r.error 설정 → main 흐름에서 fallback (Playwright) 으로 재시도 가능.
+    preferred_color_field: 'color' (display 이름, 영문) / 'search_color' (현지화 이름).
+      - adidas.com US → 'color' 우선 (예: 'Carbon / Black')
+      - adidas.jp     → 'search_color' 우선 (예: 'ターコイズ', 'color' 는 종종 truncated)
+    """
+    r = ProductResult(product_no=product_no, url=source_url)
+    sess = _get_adidas_session(base_url)
+    # 호출 간격 — adidas 가 burst 에 민감, 호출 사이 짧은 sleep
+    try:
+        prod_resp = sess.get(f"{base_url}/api/products/{pid}", timeout=15)
+    except Exception as e:
+        r.error = f"adidas api product http error: {e}"
+        return r
+    if prod_resp.status_code != 200:
+        r.error = f"adidas api product status={prod_resp.status_code}"
+        return r
+    try:
+        prod = prod_resp.json()
+    except Exception as e:
+        r.error = f"adidas api product json: {e}"
+        return r
+
+    time.sleep(0.4)
+    try:
+        avail_resp = sess.get(f"{base_url}/api/products/{pid}/availability", timeout=15)
+    except Exception as e:
+        r.error = f"adidas api availability http error: {e}"
+        return r
+    if avail_resp.status_code != 200:
+        r.error = f"adidas api availability status={avail_resp.status_code}"
+        return r
+    try:
+        avail = avail_resp.json()
+    except Exception as e:
+        r.error = f"adidas api availability json: {e}"
+        return r
+
+    # 색상 추출 (preferred 우선)
+    attrs = prod.get("attribute_list") or {}
+    color_main = (attrs.get("color") or "").strip()
+    color_search = (attrs.get("search_color") or attrs.get("search_color_raw") or "").strip()
+    if preferred_color_field == "search_color":
+        color = color_search or color_main or "Default"
+    else:
+        color = color_main or color_search or "Default"
+
+    # 가격
+    pricing = prod.get("pricing_information") or {}
+    price = pricing.get("currentPrice") or pricing.get("standard_price")
+    try:
+        price = float(price) if price is not None else None
+    except Exception:
+        price = None
+
+    # 사이즈 / 재고
+    sizes: list[SizeVariant] = []
+    for v in avail.get("variation_list", []):
+        size_label = (v.get("size") or "").strip()
+        if not size_label:
+            continue
+        status_str = (v.get("availability_status") or "").upper()
+        try:
+            qty = int(v.get("availability") or 0)
+        except Exception:
+            qty = 0
+        if status_str == "NOT_AVAILABLE":
+            status = S.OUT_OF_STOCK
+        elif 0 < qty <= 3:
+            status = S.LOW_STOCK
+        else:
+            status = S.IN_STOCK
+        sizes.append(SizeVariant(size_label, status, qty))
+
+    if not sizes and price is None:
+        r.error = "adidas api: empty result (no sizes, no price)"
+        return r
+
+    r.colors.append(ColorResult(color=color, sizes=sizes, price=price, currency=currency))
+    return r
+
+
+def _extract_adidas_pid(url: str) -> Optional[str]:
+    """adidas 상품 URL 에서 PID 추출 (예: /us/.../JN0298.html → 'JN0298')."""
+    m = re.search(r"/([A-Z]{2}\d{4})\.html", url)
+    return m.group(1) if m else None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -291,7 +427,28 @@ def fetch_uniqlo(url: str, product_no: str, browser, *, config: dict) -> Product
 
 
 def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
-    """Adidas US — JSON-LD Product + DOM 'unavailable' class.
+    """Adidas US — API-first.
+
+    PATCH 4 (2026-05-15):
+      1) /api/products/{PID} + /api/products/{PID}/availability 직접 호출 (requests)
+         - SPA 렌더 의존 사라짐 → headless 봇 감지 우회
+         - JSON 응답에서 color/price/사이즈별 qty 까지 정확히 추출
+      2) API 실패 시 (4xx/5xx) 기존 Playwright 방식으로 fallback
+    """
+    pid = _extract_adidas_pid(url)
+    if pid:
+        api_result = _adidas_api_fetch(
+            pid, "https://www.adidas.com", "USD", product_no, url,
+            preferred_color_field="color",
+        )
+        if not api_result.error:
+            return api_result
+        print(f"    [adidas-api] {api_result.error} → fallback to playwright", flush=True)
+    return _fetch_adidas_us_playwright(url, product_no, browser, config=config)
+
+
+def _fetch_adidas_us_playwright(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
+    """Adidas US Playwright fallback — JSON-LD Product + DOM 'unavailable' class.
 
     한국 IP / Accept-Language 등에서 접속 시 adidas.co.kr 로 server-redirect 되어
     JSON-LD 의 `color` 가 비거나 사이즈 라벨이 'J/XS' 같은 일본 표기로 바뀌는
@@ -299,19 +456,10 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
       1) en-US locale + America/New_York timezone + 뉴욕 geolocation 설정한 context
       2) Accept-Language / Referer / sec-ch-ua-* 등 US 브라우저 헤더 주입
       3) adidas.com US 도메인에 미리 region/locale 쿠키 심기
-         (geoCountry=US, locale=en_US, akacd_*=US, geoip=US-…)
       4) `page.route('**/adidas.co.kr/**')` 로 .co.kr 호스트 네트워크 요청 abort
-         + 최종 URL 이 여전히 adidas.com 인지 검증
-
-    색상은 JSON-LD `color` (full name, e.g. 'Pure Tangerine / Pure Orange') →
-    title 패턴 ('adidas <name> - <Color> | ...') → __NEXT_DATA__ 의
-    `attribute_list.color` 순으로 fallback 한다.
 
     빈 결과 가드: JSON-LD 미수신 + 사이즈 버튼 0개 + 가격 None 이면 페이지 렌더 실패로 간주하고
     `r.error` 로 표시. 이 경우 main 흐름에서 시트 업데이트가 skip 되어 옛 데이터를 보존한다.
-
-    PATCH 3: page.goto 직후 wait_for_load_state('networkidle') 한 단계 추가.
-    SPA 렌더가 더 안정적으로 마무리된 후 JSON-LD 파싱 가능.
     """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(
@@ -326,7 +474,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
             "sec-ch-ua-platform": '"Windows"',
         },
     )
-    # 1) 모든 adidas 도메인에 region/locale 강제 쿠키.
     ctx.add_cookies([
         {"name": "geoCountry",   "value": "US",     "domain": ".adidas.com", "path": "/"},
         {"name": "geoRedirect",  "value": "false",  "domain": ".adidas.com", "path": "/"},
@@ -336,7 +483,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
         {"name": "default_country", "value": "US",  "domain": ".adidas.com", "path": "/"},
     ])
     page = ctx.new_page()
-    # 2) .co.kr / .jp 호스트로 가는 네트워크 요청은 전부 차단해 redirect 자체를 무력화.
     def _block_locale_redirect(route, request):
         host = urlparse(request.url).netloc.lower()
         if "adidas.co.kr" in host or "adidas.jp" in host:
@@ -349,13 +495,10 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
     page.route("**/*", _block_locale_redirect)
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # PATCH 3: networkidle 대기 — SPA 렌더 안정화
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        # JSON-LD 가 DOM 에 채워질 때까지 명시적으로 대기 (가장 신뢰성 있는 마커).
-        # JSON-LD 가 비어 있으면 SSR/CSR 모두 미완료 → 추출 실패가 확실.
         try:
             page.wait_for_function(
                 """() => {
@@ -366,7 +509,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
             )
         except Exception:
             pass
-        # 사이즈 버튼 렌더 대기 (없는 상품도 있어서 실패해도 진행).
         try:
             page.wait_for_selector('[class*="size-selector_size__"]', timeout=15000)
         except Exception:
@@ -381,7 +523,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
                 const ld = document.querySelector('script[type="application/ld+json"]');
                 const btns = Array.from(document.querySelectorAll('[class*="size-selector_size__"]'))
                     .map(b => ({text: (b.textContent||'').trim(), cls: String(b.className)}));
-                // __NEXT_DATA__ 의 attribute_list.color (full color name) 와 search_col (short)
                 let ndColor = null, ndSearchCol = null;
                 try {
                     const nd = document.getElementById('__NEXT_DATA__');
@@ -402,7 +543,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
             }"""
         )
         ld = json.loads(data["ld"]) if data["ld"] else {}
-        # 색상 추출: JSON-LD → __NEXT_DATA__ → title 정규식 → 'Default'
         color = (
             (ld.get("color") if isinstance(ld, dict) else None)
             or data.get("ndColor")
@@ -420,8 +560,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
                 continue
             oos = "unavailable" in (s.get("cls") or "")
             sizes.append(SizeVariant(t, S.OUT_OF_STOCK if oos else S.IN_STOCK, 0 if oos else 1))
-        # 빈 결과 가드 — JSON-LD 비어있고 사이즈도 0이고 가격도 없으면 페이지 렌더 실패.
-        # 시트의 옛 데이터를 망가뜨리지 않도록 error 표시 후 종료.
         if not ld and not sizes and price is None:
             r.error = f"adidas_us empty result (page render failed at {final_host})"
             return r
@@ -434,11 +572,7 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
 
 
 def _adidas_color_from_title(title: str) -> Optional[str]:
-    """'adidas <product name> - <Color> | Free Shipping with adiClub' → '<Color>'.
-
-    JSON-LD 가 없거나 region redirect 직후 색상을 비웠을 때 fallback.
-    'adidas' / 'adidas Performance' 등 brand prefix 처리.
-    """
+    """'adidas <product name> - <Color> | Free Shipping with adiClub' → '<Color>'."""
     if not title:
         return None
     m = re.match(r"^\s*adidas(?:\s+\w+)?\s+.+?\s+-\s+(.+?)\s+\|\s*", title, re.IGNORECASE)
@@ -446,49 +580,48 @@ def _adidas_color_from_title(title: str) -> Optional[str]:
 
 
 def _adidas_jp_color_from_title(title: str) -> Optional[str]:
-    """'<product> - <Color> | アディダス ジャパン' → '<Color>'.
-
-    Adidas JP 의 title 는 '- ' 로 분리된 색상명이 포함된 패턴. JSON-LD 가 비거나
-    색상이 truncated (e.g. 'Mint Ton') 일 때 fallback 으로 사용.
-    """
+    """'<product> - <Color> | アディダス ジャパン' → '<Color>'."""
     if not title:
         return None
-    # 일본어 제목 패턴: "아디다스 <제품명> - <색상> | アディダス ジャパン"
     m = re.search(r"-\s*([^|\-]+?)\s*\|\s*アディダス", title)
     if m:
         return m.group(1).strip()
-    # 영문 제목 패턴: "adidas <product> - <Color> | ..."
     m = re.search(r"-\s*([^|\-]+?)\s*\|", title)
     return m.group(1).strip() if m else None
 
 
 def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
-    """Adidas JP — JSON-LD ProductGroup for metadata + DOM 'unavailable' class for OOS.
+    """Adidas JP — API-first.
 
-    색상 추출 fallback 순서:
-      1. 색상 변형 (hasVariant 의 `!v.offers` 항목) 의 첫 번째 `color` 값
-      2. JSON-LD `pg.color` (있는 경우)
-      3. title 의 ' - <Color> | ...' 패턴
-      4. hasVariant[0].color (마지막 fallback)
-      5. 'Default'
-
-    사이즈 검출 전 `[class*="size-selector_size__"]` 가 실제로 렌더될 때까지
-    `page.wait_for_selector` 로 대기 → 사이즈 0개로 잡혀 '정상' 표기 방지.
-
-    PATCH 3: page.goto 직후 wait_for_load_state('networkidle') 한 단계 추가.
+    PATCH 4 (2026-05-15):
+      1) /api/products/{PID} + /api/products/{PID}/availability 직접 호출 (requests)
+      2) API 실패 시 기존 Playwright 방식으로 fallback
+      3) preferred_color_field='search_color' — JP 사이트는 attribute_list.color 가
+         자주 truncated (예: 'Mint Ton') 이지만 search_color 가 표시명 ('ターコイズ') 과 일치.
     """
+    pid = _extract_adidas_pid(url)
+    if pid:
+        api_result = _adidas_api_fetch(
+            pid, "https://www.adidas.jp", "JPY", product_no, url,
+            preferred_color_field="search_color",
+        )
+        if not api_result.error:
+            return api_result
+        print(f"    [adidas-api] {api_result.error} → fallback to playwright", flush=True)
+    return _fetch_adidas_jp_playwright(url, product_no, browser, config=config)
+
+
+def _fetch_adidas_jp_playwright(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
+    """Adidas JP Playwright fallback — JSON-LD ProductGroup + DOM 'unavailable' class."""
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(user_agent=DEFAULT_UA, locale="ja-JP")
     try:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # PATCH 3: networkidle 대기 — SPA 렌더 안정화
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        # ProductGroup JSON-LD 가 DOM 에 들어올 때까지 명시적 대기. headless 환경에서 페이지
-        # 렌더가 늦어 빈 결과가 시트의 옛 데이터를 망가뜨리는 문제 방지.
         try:
             page.wait_for_function(
                 """() => {
@@ -505,7 +638,7 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
         try:
             page.wait_for_selector('[class*="size-selector_size__"]', timeout=15000)
         except Exception:
-            pass  # 사이즈 셀렉터가 없는 상품도 있음 — 진행
+            pass
         page.wait_for_timeout(config.get("wait_ms", 8000))
         data = page.evaluate(
             """() => {
@@ -523,7 +656,6 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
         color_variants = [v for v in (pg.get("hasVariant") or []) if not v.get("offers")]
         price = (size_variants[0].get("offers", {}) if size_variants else {}).get("price")
         currency = (size_variants[0].get("offers", {}) if size_variants else {}).get("priceCurrency") or "JPY"
-        # 색상 — 다단계 fallback
         color = (
             (color_variants[0].get("color") if color_variants else None)
             or pg.get("color")
@@ -535,7 +667,6 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
         for s in data["sizes"]:
             oos = "unavailable" in (s.get("cls") or "")
             sizes.append(SizeVariant(s["size"], S.OUT_OF_STOCK if oos else S.IN_STOCK, 0 if oos else 1))
-        # 빈 결과 가드 — ProductGroup 없고 사이즈도 0이고 가격도 None이면 페이지 렌더 실패로 판정.
         if not pg and not sizes and price is None:
             r.error = f"adidas_jp empty result (page render failed)"
             return r
@@ -583,19 +714,16 @@ def fetch_top4running(url: str, product_no: str, browser, *, config: dict) -> Pr
          (Execution context destroyed 에러 방지)
       2. JSON-LD ProductGroup 이 실제로 DOM 에 들어올 때까지 wait_for_function 대기
       3. 모든 JSON-LD 스크립트 중에서 ProductGroup 만 골라서 추출
-         (페이지에 LD 가 여러 개 있을 수 있음)
     """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(user_agent=DEFAULT_UA, locale="de-DE")
     try:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        # 1) 진행 중인 navigation/redirect 가 정착할 때까지 대기 (Execution context destroyed 방지)
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
-            pass  # 분석/광고 polling 으로 networkidle 안 떨어지는 경우 정상
-        # 2) ProductGroup JSON-LD 가 실제로 DOM 에 들어올 때까지 대기
+            pass
         try:
             page.wait_for_function(
                 """() => {
@@ -614,7 +742,6 @@ def fetch_top4running(url: str, product_no: str, browser, *, config: dict) -> Pr
         except Exception:
             pass
         page.wait_for_timeout(config.get("wait_ms", 2000))
-        # 3) ProductGroup 만 골라서 추출
         ld_text = page.evaluate(
             """() => {
                 const ss = document.querySelectorAll('script[type="application/ld+json"]');
@@ -861,7 +988,6 @@ def parse_prev_oos(prev_d: str) -> set[str]:
         has_legacy_kw = ("품절" in part) or ("OOS" in part.upper())
         if not (has_oos_marker or has_legacy_kw):
             continue
-        # ⚠️ 만 있고 OOS 마커 없는 파트는 제외 (재고 적음 ≠ OOS)
         if ("⚠️" in part) and not has_oos_marker and not has_legacy_kw:
             continue
         for t in re.findall(r"\b(?:J/)?(?:XXS|XS|S|M|L|XL|XXL|XXXL|2XL|3XL|4XL|\d{1,3}(?:\.\d)?(?:cm)?)\b", part):
@@ -894,26 +1020,21 @@ def classify_stock(prev_d: str, sizes: list[SizeVariant]):
     today_low = [s for s in sizes if s.status == S.LOW_STOCK or (s.status == S.IN_STOCK and 0 < s.qty <= 3)]
     low_sizes = sorted({s.size for s in today_low if s.size not in today_oos})
     qmap = {s.size: s.qty for s in today_low}
-    # 첫등록 (prev_d 가 비어 있음)
     is_first_registration = not prev_d or not prev_d.strip()
     if is_first_registration:
         all_sizes = {s.size for s in sizes}
-        # 전 사이즈 OOS
         if today_oos and today_oos == all_sizes:
             text = "⚫"
             if low_sizes:
                 text += " / ⚠️ " + ", ".join(f"{s} ({qmap.get(s, 0)})" for s in low_sizes)
             return text, COLOR_NEW_OOS, [], []
-        # 일부 OOS
         if today_oos:
             parts = [f"🟤 {', '.join(sorted(today_oos))}"]
             if low_sizes:
                 parts.append("⚠️ " + ", ".join(f"{s} ({qmap.get(s, 0)})" for s in low_sizes))
             return " / ".join(parts), COLOR_CONT_OOS, [], []
-        # 첫등록 + 전 사이즈 정상 → 일반 로직 fall-through
 
     prev_oos = parse_prev_oos(prev_d)
-    # ⚫ sentinel: 이전에 전 사이즈 OOS 였음 → 오늘 모든 사이즈를 "이전 OOS" 로 간주
     if "__ALL__" in prev_oos:
         prev_oos = {s.size for s in sizes}
     new_oos = sorted(today_oos - prev_oos)
@@ -1087,7 +1208,6 @@ def main():
         print("ERROR: GOOGLE_CREDENTIALS and GOOGLE_SHEET_ID env vars are required", file=sys.stderr)
         sys.exit(2)
 
-    # site_config.json (선택사항 — 없으면 빈 dict)
     site_cfg: dict = {}
     if os.path.exists(args.config):
         try:
@@ -1149,8 +1269,9 @@ def main():
                     site_key = next((k for k in site_cfg if k in host), host)
                     cfg = site_cfg.get(site_key, {})
                     print(f"  [#{prod['no']}] {prod['name'][:40]} ({prod['grade']}) {host}", flush=True)
-                    # PATCH 2: 빈 결과로 떨어지기 쉬운 사이트(adidas/top4running)는 retry wrapper 사용
-                    if any(s in host for s in ("adidas", "top4running")):
+                    # adidas 는 PATCH 4 로 API 우선 시도 → retry 불필요 (실패 시 내부 fallback)
+                    # top4running 만 retry wrapper 사용
+                    if "top4running" in host:
                         res = _retry_fetch(fn, prod["url"], prod["no"], browser, cfg)
                     else:
                         res = fn(prod["url"], prod["no"], browser, config=cfg)
