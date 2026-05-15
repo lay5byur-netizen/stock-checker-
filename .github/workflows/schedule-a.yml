@@ -1,9 +1,9 @@
-name: Schedule A (A등급 매일 09:41 KST)
+name: Schedule A (A등급 매일 09:47 KST)
 
 on:
   schedule:
-    # 09:41 KST = 00:41 UTC, daily
-    - cron: '41 0 * * *'
+    # 09:47 KST = 00:47 UTC, daily (정시 회피)
+    - cron: '47 0 * * *'   # 09:47 KST, 정시에서 멀리
   workflow_dispatch: {}
 
 permissions:
