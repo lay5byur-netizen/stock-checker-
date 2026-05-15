@@ -25,6 +25,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
@@ -45,10 +46,10 @@ DEFAULT_UA = (
 )
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+
 # ──────────────────────────────────────────────────────────────────────
 # 데이터 모델
 # ──────────────────────────────────────────────────────────────────────
-
 class S:
     IN_STOCK = "IN_STOCK"
     OUT_OF_STOCK = "OUT_OF_STOCK"
@@ -80,9 +81,35 @@ class ProductResult:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 재시도 헬퍼 (PATCH 2)
+# ──────────────────────────────────────────────────────────────────────
+def _retry_fetch(fetcher_fn, url, product_no, browser, config, max_retries=2):
+    """첫 시도 실패(error 가 'empty result' 또는 'page render failed' 등) 시 한 번 더 시도.
+
+    GitHub Actions IP 에서 adidas 가 종종 첫 요청을 빈 응답으로 throttle 하는 문제,
+    top4running 의 navigation race 같은 일시적 실패를 우회한다.
+    재시도할 가치가 있는 에러 패턴만 재시도하고, 명확한 코드 에러는 즉시 반환.
+    """
+    last = None
+    for attempt in range(max_retries):
+        result = fetcher_fn(url, product_no, browser, config=config)
+        last = result
+        if not result.error:
+            return result
+        # 재시도할 가치가 있는 에러만
+        retryable_keywords = ("empty result", "page render failed", "Execution context",
+                              "no JSON-LD", "no ProductGroup", "Timeout")
+        if not any(kw in (result.error or "") for kw in retryable_keywords):
+            return result
+        if attempt < max_retries - 1:
+            print(f"    [retry] attempt {attempt+1} failed ({result.error[:60]}); retrying in 3s...", flush=True)
+            time.sleep(3)
+    return last
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 사이트별 추출 로직
 # ──────────────────────────────────────────────────────────────────────
-
 OOS_JP_PATTERNS = re.compile(r"売り切れ|在庫切れ|品切れ|再入荷|入荷待ち|入荷時に通知|SOLD\s*OUT", re.IGNORECASE)
 
 # Uniqlo 색상 코드 매핑 — API 가 colorName 을 null 로 반환할 때 displayCode 로 사람-읽기 좋은 이름 매핑.
@@ -275,12 +302,16 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
          (geoCountry=US, locale=en_US, akacd_*=US, geoip=US-…)
       4) `page.route('**/adidas.co.kr/**')` 로 .co.kr 호스트 네트워크 요청 abort
          + 최종 URL 이 여전히 adidas.com 인지 검증
+
     색상은 JSON-LD `color` (full name, e.g. 'Pure Tangerine / Pure Orange') →
     title 패턴 ('adidas <name> - <Color> | ...') → __NEXT_DATA__ 의
     `attribute_list.color` 순으로 fallback 한다.
 
     빈 결과 가드: JSON-LD 미수신 + 사이즈 버튼 0개 + 가격 None 이면 페이지 렌더 실패로 간주하고
     `r.error` 로 표시. 이 경우 main 흐름에서 시트 업데이트가 skip 되어 옛 데이터를 보존한다.
+
+    PATCH 3: page.goto 직후 wait_for_load_state('networkidle') 한 단계 추가.
+    SPA 렌더가 더 안정적으로 마무리된 후 JSON-LD 파싱 가능.
     """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(
@@ -316,9 +347,13 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
         else:
             route.continue_()
     page.route("**/*", _block_locale_redirect)
-
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # PATCH 3: networkidle 대기 — SPA 렌더 안정화
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
         # JSON-LD 가 DOM 에 채워질 때까지 명시적으로 대기 (가장 신뢰성 있는 마커).
         # JSON-LD 가 비어 있으면 SSR/CSR 모두 미완료 → 추출 실패가 확실.
         try:
@@ -337,12 +372,10 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
         except Exception:
             pass
         page.wait_for_timeout(config.get("wait_ms", 8000))
-
         final_host = urlparse(page.url).netloc.lower()
         if "adidas.com" not in final_host or "co.kr" in final_host:
             r.error = f"adidas_us redirected to {final_host} despite block; check region cookies/IP"
             return r
-
         data = page.evaluate(
             """() => {
                 const ld = document.querySelector('script[type="application/ld+json"]');
@@ -369,7 +402,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
             }"""
         )
         ld = json.loads(data["ld"]) if data["ld"] else {}
-
         # 색상 추출: JSON-LD → __NEXT_DATA__ → title 정규식 → 'Default'
         color = (
             (ld.get("color") if isinstance(ld, dict) else None)
@@ -378,7 +410,6 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
             or data.get("ndSearchCol")
             or "Default"
         )
-
         offers = ld.get("offers") or {} if isinstance(ld, dict) else {}
         price = offers.get("price")
         currency = offers.get("priceCurrency") or "USD"
@@ -389,13 +420,11 @@ def fetch_adidas_us(url: str, product_no: str, browser, *, config: dict) -> Prod
                 continue
             oos = "unavailable" in (s.get("cls") or "")
             sizes.append(SizeVariant(t, S.OUT_OF_STOCK if oos else S.IN_STOCK, 0 if oos else 1))
-
         # 빈 결과 가드 — JSON-LD 비어있고 사이즈도 0이고 가격도 없으면 페이지 렌더 실패.
         # 시트의 옛 데이터를 망가뜨리지 않도록 error 표시 후 종료.
         if not ld and not sizes and price is None:
             r.error = f"adidas_us empty result (page render failed at {final_host})"
             return r
-
         r.colors.append(ColorResult(color=color, sizes=sizes, price=price, currency=currency))
     except Exception as e:
         r.error = f"adidas_us error: {e}"
@@ -445,12 +474,19 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
 
     사이즈 검출 전 `[class*="size-selector_size__"]` 가 실제로 렌더될 때까지
     `page.wait_for_selector` 로 대기 → 사이즈 0개로 잡혀 '정상' 표기 방지.
+
+    PATCH 3: page.goto 직후 wait_for_load_state('networkidle') 한 단계 추가.
     """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(user_agent=DEFAULT_UA, locale="ja-JP")
     try:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # PATCH 3: networkidle 대기 — SPA 렌더 안정화
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
         # ProductGroup JSON-LD 가 DOM 에 들어올 때까지 명시적 대기. headless 환경에서 페이지
         # 렌더가 늦어 빈 결과가 시트의 옛 데이터를 망가뜨리는 문제 방지.
         try:
@@ -499,12 +535,10 @@ def fetch_adidas_jp(url: str, product_no: str, browser, *, config: dict) -> Prod
         for s in data["sizes"]:
             oos = "unavailable" in (s.get("cls") or "")
             sizes.append(SizeVariant(s["size"], S.OUT_OF_STOCK if oos else S.IN_STOCK, 0 if oos else 1))
-
-        # 빈 결과 가드 — ProductGroup 없고 사이즈도 0이고 가격도 없으면 페이지 렌더 실패로 판정.
+        # 빈 결과 가드 — ProductGroup 없고 사이즈도 0이고 가격도 None이면 페이지 렌더 실패로 판정.
         if not pg and not sizes and price is None:
             r.error = f"adidas_jp empty result (page render failed)"
             return r
-
         r.colors.append(ColorResult(color=color, sizes=sizes, price=price, currency=currency))
     except Exception as e:
         r.error = f"adidas_jp error: {e}"
@@ -542,15 +576,57 @@ def fetch_swim2000(url: str, product_no: str, browser, *, config: dict) -> Produ
 
 
 def fetch_top4running(url: str, product_no: str, browser, *, config: dict) -> ProductResult:
-    """top4running.de — JSON-LD ProductGroup, size from offers.url ?size= param."""
+    """top4running.de — JSON-LD ProductGroup, size from offers.url ?size= param.
+
+    PATCH 1: 전면 개선
+      1. networkidle 대기 → 쿠키 배너/country selector redirect 정착 후 evaluate
+         (Execution context destroyed 에러 방지)
+      2. JSON-LD ProductGroup 이 실제로 DOM 에 들어올 때까지 wait_for_function 대기
+      3. 모든 JSON-LD 스크립트 중에서 ProductGroup 만 골라서 추출
+         (페이지에 LD 가 여러 개 있을 수 있음)
+    """
     r = ProductResult(product_no=product_no, url=url)
     ctx = browser.new_context(user_agent=DEFAULT_UA, locale="de-DE")
     try:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(config.get("wait_ms", 4000))
+        # 1) 진행 중인 navigation/redirect 가 정착할 때까지 대기 (Execution context destroyed 방지)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass  # 분석/광고 polling 으로 networkidle 안 떨어지는 경우 정상
+        # 2) ProductGroup JSON-LD 가 실제로 DOM 에 들어올 때까지 대기
+        try:
+            page.wait_for_function(
+                """() => {
+                    const ss = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const s of ss) {
+                        try {
+                            const j = JSON.parse(s.textContent);
+                            const arr = Array.isArray(j) ? j : [j];
+                            if (arr.some(o => o && o['@type'] === 'ProductGroup')) return true;
+                        } catch (e) {}
+                    }
+                    return false;
+                }""",
+                timeout=15000,
+            )
+        except Exception:
+            pass
+        page.wait_for_timeout(config.get("wait_ms", 2000))
+        # 3) ProductGroup 만 골라서 추출
         ld_text = page.evaluate(
-            """() => document.querySelector('script[type="application/ld+json"]')?.textContent || null"""
+            """() => {
+                const ss = document.querySelectorAll('script[type="application/ld+json"]');
+                for (const s of ss) {
+                    try {
+                        const j = JSON.parse(s.textContent);
+                        const arr = Array.isArray(j) ? j : [j];
+                        if (arr.some(o => o && o['@type'] === 'ProductGroup')) return s.textContent;
+                    } catch (e) {}
+                }
+                return null;
+            }"""
         )
     except Exception as e:
         r.error = f"top4running error: {e}"
@@ -559,6 +635,7 @@ def fetch_top4running(url: str, product_no: str, browser, *, config: dict) -> Pr
     finally:
         try: ctx.close()
         except: pass
+
     if not ld_text:
         r.error = "no JSON-LD"
         return r
@@ -625,7 +702,6 @@ def fetch_runningwarehouse(url: str, product_no: str, browser, *, config: dict) 
     finally:
         try: ctx.close()
         except: pass
-
     color = data.get("color") or "Default"
     sizes_data = data.get("sizes") or []
     sizes: list[SizeVariant] = []
@@ -735,7 +811,6 @@ def pick_fetcher(url: str):
 # ──────────────────────────────────────────────────────────────────────
 # 가격 포맷 + 분류 로직
 # ──────────────────────────────────────────────────────────────────────
-
 def format_price(price: Optional[float], currency: str = "USD") -> str:
     if price is None:
         return ""
@@ -819,7 +894,6 @@ def classify_stock(prev_d: str, sizes: list[SizeVariant]):
     today_low = [s for s in sizes if s.status == S.LOW_STOCK or (s.status == S.IN_STOCK and 0 < s.qty <= 3)]
     low_sizes = sorted({s.size for s in today_low if s.size not in today_oos})
     qmap = {s.size: s.qty for s in today_low}
-
     # 첫등록 (prev_d 가 비어 있음)
     is_first_registration = not prev_d or not prev_d.strip()
     if is_first_registration:
@@ -842,11 +916,9 @@ def classify_stock(prev_d: str, sizes: list[SizeVariant]):
     # ⚫ sentinel: 이전에 전 사이즈 OOS 였음 → 오늘 모든 사이즈를 "이전 OOS" 로 간주
     if "__ALL__" in prev_oos:
         prev_oos = {s.size for s in sizes}
-
     new_oos = sorted(today_oos - prev_oos)
     cont_oos = sorted(today_oos & prev_oos)
     restocked = sorted(prev_oos & today_in)
-
     parts, color = [], None
     if new_oos:
         parts.append(f"🔴 {', '.join(new_oos)}"); color = COLOR_NEW_OOS
@@ -885,7 +957,6 @@ def classify_price(prev_e: str, current_price: Optional[float], currency: str):
 # ──────────────────────────────────────────────────────────────────────
 # Google Sheets
 # ──────────────────────────────────────────────────────────────────────
-
 class Sheets:
     def __init__(self, spreadsheet_id: str, credentials_json_or_path: str):
         creds_raw = credentials_json_or_path
@@ -969,7 +1040,6 @@ def _col_idx(letter: str) -> int:
 # ──────────────────────────────────────────────────────────────────────
 # 이메일 알림
 # ──────────────────────────────────────────────────────────────────────
-
 def send_email(subject: str, body: str):
     host = os.environ.get("SMTP_HOST")
     user = os.environ.get("SMTP_USER")
@@ -994,7 +1064,6 @@ def send_email(subject: str, body: str):
 # ──────────────────────────────────────────────────────────────────────
 # 메인 실행 흐름
 # ──────────────────────────────────────────────────────────────────────
-
 def kst_now() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
@@ -1080,7 +1149,11 @@ def main():
                     site_key = next((k for k in site_cfg if k in host), host)
                     cfg = site_cfg.get(site_key, {})
                     print(f"  [#{prod['no']}] {prod['name'][:40]} ({prod['grade']}) {host}", flush=True)
-                    res = fn(prod["url"], prod["no"], browser, config=cfg)
+                    # PATCH 2: 빈 결과로 떨어지기 쉬운 사이트(adidas/top4running)는 retry wrapper 사용
+                    if any(s in host for s in ("adidas", "top4running")):
+                        res = _retry_fetch(fn, prod["url"], prod["no"], browser, cfg)
+                    else:
+                        res = fn(prod["url"], prod["no"], browser, config=cfg)
                     counts["checked"] += 1
                     if res.error:
                         print(f"    error: {res.error}", flush=True)
